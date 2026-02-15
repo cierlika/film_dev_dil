@@ -32,7 +32,29 @@ import numpy as np
 import pandas as pd
 from scipy import stats as sp_stats
 
+import re
+import numpy as np   
 
+
+def _parse_temp_celsius(raw: object) -> float:
+
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+        return float("nan")
+    s = str(raw).strip()
+    # Fahrenheit
+    m_f = re.match(r"^([\d.]+)\s*°?[Ff]$", s)
+    if m_f:
+        return (float(m_f.group(1)) - 32) * 5 / 9
+    # Celsius (explicit suffix)
+    m_c = re.match(r"^([\d.]+)\s*°?[Cc]$", s)
+    if m_c:
+        return float(m_c.group(1))
+    # Bare number – assume Celsius
+    m_n = re.match(r"^([\d.]+)$", s)
+    if m_n:
+        return float(m_n.group(1))
+    return float("nan")
+        
 class DataSplitter:
     """
     Stratified train/val/test splitter with persistence.
