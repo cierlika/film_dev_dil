@@ -40,9 +40,9 @@ TEMP_MIN_C: float = 18.0
 TEMP_MAX_C: float = 24.0
 
 # ─── Cross-validation settings ───────────────────────────────────────────────
-N_FOLDS: int    = 5
-VAL_FRAC: float = 0.15   # fraction of training fold used for validation
-RANDOM_STATE: int = 42
+N_FOLDS: int         = 5
+TEST_FRACTION: float = 0.2   # fraction of data held out as shared test set
+RANDOM_STATE: int    = 42
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -233,53 +233,52 @@ def prepare_data(
 def make_splits(
     df: pd.DataFrame,
     n_folds: int = N_FOLDS,
-    val_frac: float = VAL_FRAC,
+    test_fraction: float = TEST_FRACTION,
     random_state: int = RANDOM_STATE,
-) -> list[dict[str, list[int]]]:
+) -> dict:
     """
-    Generate stratified CV fold indices.
+    Generate CV splits using the original DataSplitter logic.
 
-    Stratification is approximate – we bucket the log-target into quantiles and
-    ensure each bucket is represented in every fold.
+    One shared held-out test set is carved out first (test_fraction of all
+    rows). The remaining trainval rows are divided into n_folds equal folds
+    using KFold; each fold becomes the validation set for one CV iteration
+    while the rest of trainval is used for training.
 
-    Returns a list of dicts:
-        [{"train": [...], "val": [...], "test": [...]}, ...]
-
-    The "test" split for fold i is fold i itself.
-    The "val" split is a random subset of the remaining training rows.
-    The "train" split is the rest.
+    Returns a dict (the splits.json schema):
+        {
+            "seed":          <int>,
+            "n_folds":       <int>,
+            "test_fraction": <float>,
+            "n_total":       <int>,
+            "test_indices":  [<int>, ...],          # shared across all folds
+            "fold_indices":  [[<int>, ...], ...],   # one list per fold (val set)
+        }
 
     All indices are integer positional indices into `df` (after reset_index).
     """
-    n = len(df)
-    log_times = np.log(df["Time"].values)
-    # Quantile-based stratification labels
-    n_quantiles = min(10, n // n_folds)
-    labels = pd.qcut(log_times, q=n_quantiles, labels=False, duplicates="drop")
-
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
-
+    n   = len(df)
     rng = np.random.default_rng(random_state)
-    splits = []
 
-    for fold_idx, (trainval_idx, test_idx) in enumerate(kf.split(np.arange(n), labels)):
-        # Carve out a validation set from trainval
-        n_val = max(1, int(len(trainval_idx) * val_frac))
-        perm  = rng.permutation(len(trainval_idx))
-        val_positions  = perm[:n_val]
-        train_positions = perm[n_val:]
+    # 1. Hold out a shared test set
+    n_test   = int(n * test_fraction)
+    test_pos = sorted(rng.choice(n, size=n_test, replace=False).tolist())
+    tv_pos   = sorted(set(range(n)) - set(test_pos))
 
-        val_idx   = trainval_idx[val_positions].tolist()
-        train_idx = trainval_idx[train_positions].tolist()
+    # 2. Divide trainval into n_folds using KFold (each fold → val set)
+    kf     = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+    tv_arr = np.array(tv_pos)
+    fold_indices = []
+    for _, val_local in kf.split(tv_arr):
+        fold_indices.append(sorted(tv_arr[val_local].tolist()))
 
-        splits.append({
-            "fold":  fold_idx,
-            "train": sorted(train_idx),
-            "val":   sorted(val_idx),
-            "test":  sorted(test_idx.tolist()),
-        })
-
-    return splits
+    return {
+        "seed":          random_state,
+        "n_folds":       n_folds,
+        "test_fraction": test_fraction,
+        "n_total":       n,
+        "test_indices":  test_pos,
+        "fold_indices":  fold_indices,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -288,11 +287,11 @@ def make_splits(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare data and generate CV splits")
-    parser.add_argument("--csv",          default=str(DEFAULT_CSV), help="Path to raw CSV")
-    parser.add_argument("--splits-out",   default=str(SPLITS_PATH), help="Output path for splits.json")
-    parser.add_argument("--n-folds",      type=int,   default=N_FOLDS)
-    parser.add_argument("--val-frac",     type=float, default=VAL_FRAC)
-    parser.add_argument("--random-state", type=int,   default=RANDOM_STATE)
+    parser.add_argument("--csv",           default=str(DEFAULT_CSV), help="Path to raw CSV")
+    parser.add_argument("--splits-out",    default=str(SPLITS_PATH), help="Output path for splits.json")
+    parser.add_argument("--n-folds",       type=int,   default=N_FOLDS)
+    parser.add_argument("--test-fraction", type=float, default=TEST_FRACTION)
+    parser.add_argument("--random-state",  type=int,   default=RANDOM_STATE)
     parser.add_argument(
         "--no-temp-filter",
         action="store_true",
@@ -308,7 +307,7 @@ def main() -> None:
     splits = make_splits(
         df,
         n_folds=args.n_folds,
-        val_frac=args.val_frac,
+        test_fraction=args.test_fraction,
         random_state=args.random_state,
     )
 
@@ -316,12 +315,11 @@ def main() -> None:
     with open(out_path, "w") as f:
         json.dump(splits, f, indent=2)
 
-    print(f"[data_split] wrote {len(splits)} folds to {out_path}")
-    for s in splits:
-        print(
-            f"  fold {s['fold']}: "
-            f"train={len(s['train'])}, val={len(s['val'])}, test={len(s['test'])}"
-        )
+    n_tv = splits["n_total"] - len(splits["test_indices"])
+    print(f"[data_split] wrote {splits['n_folds']} folds to {out_path}")
+    print(f"  test={len(splits['test_indices']):,}  trainval={n_tv:,}")
+    for i, fi in enumerate(splits["fold_indices"]):
+        print(f"  fold {i}: val={len(fi):,}  train={n_tv - len(fi):,}")
 
 
 if __name__ == "__main__":
