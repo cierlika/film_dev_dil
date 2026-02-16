@@ -649,7 +649,19 @@ def main() -> None:
             f"{splits_path} not found. Run `python data_split.py` first."
         )
     with open(splits_path) as f:
-        splits = json.load(f)
+        raw_splits = json.load(f)
+
+    # Convert the on-disk format (one shared test set + per-fold val lists) to
+    # the list[dict] format expected by run_optuna() and full_cv_run().
+    _n_total      = raw_splits["n_total"]
+    _test_pos     = raw_splits["test_indices"]
+    _fold_val_pos = raw_splits["fold_indices"]
+    _trainval_pos = sorted(set(range(_n_total)) - set(_test_pos))
+    splits = []
+    for _i, _val_pos in enumerate(_fold_val_pos):
+        _train_pos = sorted(set(_trainval_pos) - set(_val_pos))
+        splits.append({"fold": _i, "train": _train_pos,
+                       "val": _val_pos, "test": _test_pos})
 
     print(f"\n[train] algorithm={algorithm!r}  n_folds={len(splits)}  "
           f"n_rows={len(df)}  log_target={use_log_target}")
