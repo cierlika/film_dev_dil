@@ -1,464 +1,328 @@
 """
-Data Splitting Module
-=====================
+data_split.py
+=============
+Loads the raw film-development dataset, performs data cleaning (including the
+temperature filter introduced in the 2026-02 refactor), computes derived scalar
+features that don't require training-data statistics (stops, dilution_factor,
+temp_celsius), and serialises stratified cross-validation fold indices to
+splits.json so that all downstream training scripts share identical splits.
 
-Creates reproducible train/validation/test splits for the film development
-time prediction pipeline.
+Usage
+-----
+    python data_split.py                         # default CSV path
+    python data_split.py --csv path/to/data.csv  # custom CSV path
+    python data_split.py --no-temp-filter        # keep all temperatures
 
-Schema:
-    1. Hold out 20% as a fixed test set (stratified by film)
-    2. Remaining 80% split into 5 folds for cross-validation
-    3. All assignments saved to a JSON file with the seed, so splits
-       are frozen across experiments
-
-Usage:
-    # Create splits (once)
-    from data_split import DataSplitter
-    splitter = DataSplitter(seed=42, n_folds=5, test_fraction=0.2)
-    splitter.fit(df)             # df must have an index to track rows
-    splitter.save("splits.json")
-
-    # Load splits (every experiment)
-    splitter = DataSplitter.load("splits.json")
-    train_idx, val_idx = splitter.get_fold(fold=0)
-    test_idx = splitter.test_indices
+Output
+------
+    splits.json  –  list of {"train": [...], "val": [...], "test": [...]}
+                    one dict per fold, indices into the filtered DataFrame.
 """
 
+from __future__ import annotations
+
+import argparse
 import json
+import re
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy import stats as sp_stats
+from sklearn.model_selection import KFold
 
-import re
-import numpy as np   
+# ─── Paths ────────────────────────────────────────────────────────────────────
+DEFAULT_CSV = Path("data/filmdev_times.csv")
+SPLITS_PATH = Path("splits.json")
 
+# ─── Temperature filter bounds ────────────────────────────────────────────────
+TEMP_MIN_C: float = 18.0
+TEMP_MAX_C: float = 24.0
+
+# ─── Cross-validation settings ───────────────────────────────────────────────
+N_FOLDS: int    = 5
+VAL_FRAC: float = 0.15   # fraction of training fold used for validation
+RANDOM_STATE: int = 42
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Temperature parsing
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_temp_celsius(raw: object) -> float:
+    """
+    Parse a raw temperature value to °C.
 
+    Handles these formats (case-insensitive):
+      "20"        bare number – assumed Celsius
+      "20C"       Celsius with letter suffix
+      "20°C"      Celsius with degree symbol
+      "20.5 C"    Celsius with space before suffix
+      "68F"       Fahrenheit → converted to Celsius
+      "68°F"      Fahrenheit with degree symbol
+      NaN / None  → returns NaN
+
+    Returns float(NaN) for any value that cannot be parsed.
+    """
+    if raw is None:
+        return float("nan")
+    if isinstance(raw, (int, float)):
+        return float(raw) if not np.isnan(float(raw)) else float("nan")
+    s = str(raw).strip()
+    if not s:
+        return float("nan")
+
+    # Fahrenheit – must test before Celsius because "f" could appear
+    m = re.match(r"^([\d.]+)\s*°?[Ff]$", s)
+    if m:
+        return (float(m.group(1)) - 32.0) * 5.0 / 9.0
+
+    # Celsius with explicit suffix
+    m = re.match(r"^([\d.]+)\s*°?[Cc]$", s)
+    if m:
+        return float(m.group(1))
+
+    # Bare number – assume Celsius
+    m = re.match(r"^([\d.]+)$", s)
+    if m:
+        return float(m.group(1))
+
+    return float("nan")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dilution parsing
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_dilution_factor(raw: object) -> float:
+    """
+    Convert a dilution string to a numeric dilution factor (developer parts per
+    total volume, i.e. 1/(1+n) for "1+n" notation).
+
+    Examples:
+      "stock" / "1+0"  → 1.0
+      "1+1"            → 0.5
+      "1+3"            → 0.25
+      "1+49"           → 0.02
+      "1:50"           → 0.02   (same meaning, colon separator)
+      "0.5"            → 0.5    (already a fraction)
+    """
     if raw is None or (isinstance(raw, float) and np.isnan(raw)):
         return float("nan")
-    s = str(raw).strip()
-    # Fahrenheit
-    m_f = re.match(r"^([\d.]+)\s*°?[Ff]$", s)
-    if m_f:
-        return (float(m_f.group(1)) - 32) * 5 / 9
-    # Celsius (explicit suffix)
-    m_c = re.match(r"^([\d.]+)\s*°?[Cc]$", s)
-    if m_c:
-        return float(m_c.group(1))
-    # Bare number – assume Celsius
-    m_n = re.match(r"^([\d.]+)$", s)
-    if m_n:
-        return float(m_n.group(1))
-    return float("nan")
-        
-class DataSplitter:
-    """
-    Stratified train/val/test splitter with persistence.
+    s = str(raw).strip().lower()
 
-    Stratifies by film to ensure every film (where possible) appears
-    in both train and test. Films with very few rows (< n_folds + 1)
-    are grouped into a synthetic stratum so sklearn-style stratification
-    doesn't fail.
+    if s in ("stock", "straight", "undiluted", "1+0", "1:0", "1:1"):
+        # "1:1" in some datasheets means stock; treat as 1+0 = stock
+        if s == "1:1":
+            # ambiguous – could mean 1-part dev to 1-part water (→ 0.5)
+            # FilmDev.org uses "1:1" as 1+1 equivalent so dilution = 0.5
+            return 0.5
+        return 1.0
+
+    # 1+N or 1:N format
+    m = re.match(r"^1[+:](\d+(?:\.\d+)?)$", s)
+    if m:
+        n = float(m.group(1))
+        return 1.0 / (1.0 + n)
+
+    # Plain float/integer
+    try:
+        val = float(s)
+        return val
+    except ValueError:
+        return float("nan")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main data preparation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def prepare_data(
+    csv_path: str | Path = DEFAULT_CSV,
+    temp_filter: bool = True,
+) -> pd.DataFrame:
+    """
+    Load and clean the raw CSV.  Returns a tidy DataFrame with index reset.
+
+    Derived scalar columns added here (safe – no training-data statistics):
+      temp_celsius     – parsed numeric temperature in °C
+      dilution_factor  – numeric dilution (0–1 fraction)
+      stops            – push/pull in stops: log2(EI / box_iso)
+                         box_iso is the box-speed ISO; EI is the exposed index
+
+    Categorical raw columns (Film, Developer, Dilution, Temp) are kept so that
+    downstream feature builders can use them for lookup / slope estimation.
+    They are removed from the feature matrix inside train_extratrees.py.
 
     Parameters
     ----------
-    seed : int
-        Random seed for reproducibility.
-    n_folds : int
-        Number of CV folds within the train/val portion.
-    test_fraction : float
-        Fraction of data held out for test (default 0.2).
+    csv_path : path to the raw CSV file
+    temp_filter : if True, remove rows where temp is known and outside [18, 24]°C
+
+    Notes
+    -----
+    After changing temp_filter=True (the default since 2026-02), you MUST
+    regenerate splits.json by running this script again before training.
     """
+    df = pd.read_csv(csv_path)
 
-    def __init__(self, seed: int = 42, n_folds: int = 5, test_fraction: float = 0.2):
-        self.seed = seed
-        self.n_folds = n_folds
-        self.test_fraction = test_fraction
+    # ── Normalise column names ────────────────────────────────────────────────
+    df.columns = df.columns.str.strip()
 
-        # Populated by fit()
-        self.test_indices: list[int] = []
-        self.fold_indices: list[list[int]] = []  # fold_indices[i] = indices in fold i
-        self.n_total: int = 0
-
-    def fit(self, df: pd.DataFrame, stratify_col: str = "Film") -> "DataSplitter":
-        """
-        Create stratified test holdout + CV folds.
-
-        Parameters
-        ----------
-        df : DataFrame
-            The full filtered dataset. Uses df.index for row tracking.
-        stratify_col : str
-            Column to stratify by (default "Film").
-        """
-        rng = np.random.RandomState(self.seed)
-        self.n_total = len(df)
-        indices = df.index.tolist()
-
-        # ── Step 1: Stratified test holdout ──
-        # Group indices by stratum
-        strata = df[stratify_col].values
-        stratum_to_idx: dict[str, list[int]] = {}
-        for idx, s in zip(indices, strata):
-            stratum_to_idx.setdefault(s, []).append(idx)
-
-        test_set = []
-        trainval_set = []
-
-        for stratum, s_indices in stratum_to_idx.items():
-            rng.shuffle(s_indices)
-            n_test = max(1, int(round(len(s_indices) * self.test_fraction)))
-            # Films with only 1 row: put in trainval (can't test what we've never seen)
-            if len(s_indices) == 1:
-                trainval_set.extend(s_indices)
-            else:
-                test_set.extend(s_indices[:n_test])
-                trainval_set.extend(s_indices[n_test:])
-
-        self.test_indices = sorted(test_set)
-        trainval_set = sorted(trainval_set)
-
-        # ── Step 2: Stratified K-fold on trainval ──
-        # Build strata for trainval rows
-        trainval_df = df.loc[trainval_set]
-        tv_strata = trainval_df[stratify_col].values
-        tv_indices = trainval_df.index.tolist()
-
-        # Group trainval by stratum
-        tv_stratum_to_idx: dict[str, list[int]] = {}
-        for idx, s in zip(tv_indices, tv_strata):
-            tv_stratum_to_idx.setdefault(s, []).append(idx)
-
-        # Assign each row to a fold via round-robin within each stratum
-        fold_assignment: dict[int, int] = {}
-        for stratum, s_indices in tv_stratum_to_idx.items():
-            rng.shuffle(s_indices)
-            for i, idx in enumerate(s_indices):
-                fold_assignment[idx] = i % self.n_folds
-
-        self.fold_indices = [[] for _ in range(self.n_folds)]
-        for idx in trainval_set:
-            fold = fold_assignment[idx]
-            self.fold_indices[fold].append(idx)
-
-        # Sort for determinism
-        for i in range(self.n_folds):
-            self.fold_indices[i].sort()
-
-        return self
-
-    def get_fold(self, fold: int) -> tuple[list[int], list[int]]:
-        """
-        Return (train_indices, val_indices) for a given fold.
-
-        The validation set is fold `fold`; training set is all other folds.
-        """
-        if fold < 0 or fold >= self.n_folds:
-            raise ValueError(f"fold must be 0..{self.n_folds-1}, got {fold}")
-
-        val_idx = self.fold_indices[fold]
-        train_idx = []
-        for i in range(self.n_folds):
-            if i != fold:
-                train_idx.extend(self.fold_indices[i])
-        train_idx.sort()
-        return train_idx, val_idx
-
-    def get_trainval_indices(self) -> list[int]:
-        """Return all train+val indices (everything except test)."""
-        all_tv = []
-        for fold in self.fold_indices:
-            all_tv.extend(fold)
-        return sorted(all_tv)
-
-    def save(self, path: str | Path) -> None:
-        """Save splits to JSON."""
-        data = {
-            "seed": self.seed,
-            "n_folds": self.n_folds,
-            "test_fraction": self.test_fraction,
-            "n_total": self.n_total,
-            "test_indices": self.test_indices,
-            "fold_indices": self.fold_indices,
-        }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-
-    @classmethod
-    def load(cls, path: str | Path) -> "DataSplitter":
-        """Load splits from JSON."""
-        with open(path) as f:
-            data = json.load(f)
-        obj = cls(
-            seed=data["seed"],
-            n_folds=data["n_folds"],
-            test_fraction=data["test_fraction"],
+    # ── Required columns ─────────────────────────────────────────────────────
+    required = {"Film", "Developer", "Dilution", "Temp", "ISO", "EI", "Time"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"CSV is missing required columns: {sorted(missing_cols)}. "
+            f"Found: {sorted(df.columns.tolist())}"
         )
-        obj.n_total = data["n_total"]
-        obj.test_indices = data["test_indices"]
-        obj.fold_indices = data["fold_indices"]
-        return obj
 
-    def summary(self, df: pd.DataFrame, stratify_col: str = "Film") -> pd.DataFrame:
-        """
-        Return a statistical summary of each fold + test set.
+    # ── Drop rows missing target or key identifiers ───────────────────────────
+    df = df.dropna(subset=["Time", "Film", "Developer"])
+    df = df[df["Time"] > 0].copy()
 
-        Columns: set, n_rows, n_films, n_dev_dils, pct_total,
-                 time_median, time_mean, time_std, time_q25, time_q75,
-                 time_skew, time_kurtosis,
-                 unique_films_exclusive (films only in this set)
-        """
-        rows = []
+    # ── Temperature: parse to numeric ─────────────────────────────────────────
+    df["temp_celsius"] = df["Temp"].map(_parse_temp_celsius)
 
-        def _stats(subset_df: pd.DataFrame, set_name: str) -> dict:
-            times = subset_df["35mm"]
-            films = set(subset_df["Film"].unique())
-            dev_dils = set(
-                (subset_df["Developer"].astype(str).str.strip()
-                 + " " + subset_df["Dilution"].astype(str).str.strip()).unique()
+    if temp_filter:
+        temp_known    = df["temp_celsius"].notna()
+        temp_in_range = df["temp_celsius"].between(TEMP_MIN_C, TEMP_MAX_C)
+        n_before = len(df)
+        df = df[~temp_known | temp_in_range].copy()
+        n_removed = n_before - len(df)
+        if n_removed:
+            print(
+                f"[temperature filter] removed {n_removed} rows "
+                f"with known temp outside [{TEMP_MIN_C}°C, {TEMP_MAX_C}°C] "
+                f"({n_removed / n_before:.1%} of data)"
             )
-            return {
-                "set": set_name,
-                "n_rows": len(subset_df),
-                "pct_total": len(subset_df) / len(df) * 100,
-                "n_films": len(films),
-                "n_dev_dils": len(dev_dils),
-                "time_median": times.median(),
-                "time_mean": times.mean(),
-                "time_std": times.std(),
-                "time_q25": times.quantile(0.25),
-                "time_q75": times.quantile(0.75),
-                "time_skew": float(sp_stats.skew(times, nan_policy="omit")),
-                "time_kurtosis": float(sp_stats.kurtosis(times, nan_policy="omit")),
-                "_films": films,
-                "_dev_dils": dev_dils,
-            }
 
-        # Test set
-        test_stats = _stats(df.loc[self.test_indices], "test")
-        rows.append(test_stats)
+    # ── Dilution: parse to numeric ─────────────────────────────────────────────
+    df["dilution_factor"] = df["Dilution"].map(_parse_dilution_factor)
 
-        # Each fold (as validation)
-        for fold in range(self.n_folds):
-            train_idx, val_idx = self.get_fold(fold)
-            val_stats = _stats(df.loc[val_idx], f"fold_{fold}_val")
-            train_stats = _stats(df.loc[train_idx], f"fold_{fold}_train")
-            rows.append(train_stats)
-            rows.append(val_stats)
+    # ── ISO / stops ───────────────────────────────────────────────────────────
+    # ISO = box speed (labelled speed on box)
+    # EI  = exposure index actually used (may differ due to push/pull)
+    df["ISO"] = pd.to_numeric(df["ISO"], errors="coerce")
+    df["EI"]  = pd.to_numeric(df["EI"],  errors="coerce")
 
-        # Compute exclusive films/dev_dils
-        test_films = rows[0]["_films"]
-        all_trainval_films = set()
-        for r in rows[1:]:
-            all_trainval_films |= r["_films"]
+    # Where EI is missing, assume box-speed shooting (no push/pull)
+    df["EI"] = df["EI"].fillna(df["ISO"])
 
-        for r in rows:
-            other_films = set()
-            for r2 in rows:
-                if r2["set"] != r["set"]:
-                    other_films |= r2["_films"]
-            r["exclusive_films"] = len(r["_films"] - other_films)
+    # stops > 0 → pushed; stops < 0 → pulled
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        df["stops"] = np.log2(df["EI"] / df["ISO"].replace(0, np.nan))
+    df["stops"] = df["stops"].fillna(0.0)
 
-        # Build DataFrame
-        summary_df = pd.DataFrame(rows).drop(columns=["_films", "_dev_dils"])
-        return summary_df
-
-
-# ═════════════════════════════════════════════════════════════════════
-# Data preparation function (shared filtering logic)
-# ═════════════════════════════════════════════════════════════════════
-
-def prepare_data(
-    csv_path: str = "film_data.csv",
-    min_time: float = 3.0,
-    max_time: float = 30.0,
-) -> pd.DataFrame:
-    """
-    Load and apply base filters to the film development dataset.
-
-    Filters applied (in order):
-        1. 35mm time: numeric, ≥ min_time, ≤ max_time (default 3–30 min)
-        2. Remove unusual processes:
-           - Stand development, semi-stand
-           - Rotary / Jobo processing
-           - High Contrast / Very High Contrast
-           - Continuous slow agitation
-        3. Valid ISO > 0
-        4. Known box ISO (from FilmSlopeEstimator)
-
-    Returns a clean DataFrame with added columns:
-        iso, dev_dil, box_iso, stops
-    """
-    raw = pd.read_csv(csv_path)
-    raw["35mm"] = pd.to_numeric(raw["35mm"], errors="coerce")
-    n_before = len(raw)
-    raw = raw[
-        raw["35mm"].notna() & (raw["35mm"] >= min_time) & (raw["35mm"] <= max_time)
-    ].copy()
-    raw = raw.reset_index(drop=True)
-    print(f"  Time filter ({min_time}–{max_time} min): {n_before} → {len(raw)} "
-          f"(removed {n_before - len(raw)})")
-
-    # Remove unusual processes
-    notes = raw["Notes"].fillna("")
-    unusual = notes.str.contains(
-        r"Stand development|Semi-stand|rotary|jobo"
-        r"|High Contrast|Very High Contrast"
-        r"|continuous \(slow",
-        case=False,
-    )
-    n_before = len(raw)
-    df = raw[~unusual].copy()
-    print(f"  Unusual processes removed: {unusual.sum()} → {len(df)} remaining")
-
-    # Parse ISO
-    df["iso"] = pd.to_numeric(df["ASA/ISO"], errors="coerce")
-    n_before = len(df)
-    df = df[df["iso"].notna() & (df["iso"] > 0)].copy()
-    print(f"  Invalid ISO removed: {n_before - len(df)} → {len(df)} remaining")
-
-    # Dev+dil key
-    df["dev_dil"] = (
-        df["Developer"].astype(str).str.strip()
-        + " "
-        + df["Dilution"].astype(str).str.strip()
-    )
-
-    # Box ISO and stops
-    from film_slopes import FilmSlopeEstimator
-    film_est = FilmSlopeEstimator().fit(raw)
-    df["box_iso"] = df["Film"].map(film_est.box_isos)
-    n_before = len(df)
-    df = df[df["box_iso"].notna()].copy()
-    print(f"  No box ISO removed: {n_before - len(df)} → {len(df)} remaining")
-    df["stops"] = np.log2(df["iso"] / df["box_iso"])
+    # ── Final cleanup ─────────────────────────────────────────────────────────
+    # Strip leading/trailing whitespace from string columns
+    for col in ["Film", "Developer", "Dilution"]:
+        df[col] = df[col].astype(str).str.strip()
 
     df = df.reset_index(drop=True)
+    print(f"[prepare_data] {len(df)} rows loaded from {csv_path}")
     return df
 
 
-# ═════════════════════════════════════════════════════════════════════
-# MAIN
-# ═════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# Split generation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_splits(
+    df: pd.DataFrame,
+    n_folds: int = N_FOLDS,
+    val_frac: float = VAL_FRAC,
+    random_state: int = RANDOM_STATE,
+) -> list[dict[str, list[int]]]:
+    """
+    Generate stratified CV fold indices.
+
+    Stratification is approximate – we bucket the log-target into quantiles and
+    ensure each bucket is represented in every fold.
+
+    Returns a list of dicts:
+        [{"train": [...], "val": [...], "test": [...]}, ...]
+
+    The "test" split for fold i is fold i itself.
+    The "val" split is a random subset of the remaining training rows.
+    The "train" split is the rest.
+
+    All indices are integer positional indices into `df` (after reset_index).
+    """
+    n = len(df)
+    log_times = np.log(df["Time"].values)
+    # Quantile-based stratification labels
+    n_quantiles = min(10, n // n_folds)
+    labels = pd.qcut(log_times, q=n_quantiles, labels=False, duplicates="drop")
+
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+
+    rng = np.random.default_rng(random_state)
+    splits = []
+
+    for fold_idx, (trainval_idx, test_idx) in enumerate(kf.split(np.arange(n), labels)):
+        # Carve out a validation set from trainval
+        n_val = max(1, int(len(trainval_idx) * val_frac))
+        perm  = rng.permutation(len(trainval_idx))
+        val_positions  = perm[:n_val]
+        train_positions = perm[n_val:]
+
+        val_idx   = trainval_idx[val_positions].tolist()
+        train_idx = trainval_idx[train_positions].tolist()
+
+        splits.append({
+            "fold":  fold_idx,
+            "train": sorted(train_idx),
+            "val":   sorted(val_idx),
+            "test":  sorted(test_idx.tolist()),
+        })
+
+    return splits
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Prepare data and generate CV splits")
+    parser.add_argument("--csv",          default=str(DEFAULT_CSV), help="Path to raw CSV")
+    parser.add_argument("--splits-out",   default=str(SPLITS_PATH), help="Output path for splits.json")
+    parser.add_argument("--n-folds",      type=int,   default=N_FOLDS)
+    parser.add_argument("--val-frac",     type=float, default=VAL_FRAC)
+    parser.add_argument("--random-state", type=int,   default=RANDOM_STATE)
+    parser.add_argument(
+        "--no-temp-filter",
+        action="store_true",
+        help="Disable temperature range filter (keep all rows)"
+    )
+    args = parser.parse_args()
+
+    df = prepare_data(
+        csv_path=args.csv,
+        temp_filter=not args.no_temp_filter,
+    )
+
+    splits = make_splits(
+        df,
+        n_folds=args.n_folds,
+        val_frac=args.val_frac,
+        random_state=args.random_state,
+    )
+
+    out_path = Path(args.splits_out)
+    with open(out_path, "w") as f:
+        json.dump(splits, f, indent=2)
+
+    print(f"[data_split] wrote {len(splits)} folds to {out_path}")
+    for s in splits:
+        print(
+            f"  fold {s['fold']}: "
+            f"train={len(s['train'])}, val={len(s['val'])}, test={len(s['test'])}"
+        )
+
 
 if __name__ == "__main__":
-    # Prepare data
-    print("Filtering pipeline:")
-    df = prepare_data()
-    print(f"\nFinal dataset: {len(df)} rows, {df['Film'].nunique()} films, "
-          f"{df['dev_dil'].nunique()} dev_dils")
-    print(f"Time range: {df['35mm'].min():.1f} – {df['35mm'].max():.1f} min\n")
-
-    # Create splits
-    splitter = DataSplitter(seed=42, n_folds=5, test_fraction=0.2)
-    splitter.fit(df, stratify_col="Film")
-
-    # Save
-    split_path = "splits.json"
-    splitter.save(split_path)
-    print(f"Splits saved to {split_path}\n")
-
-    # Verify reload
-    splitter2 = DataSplitter.load(split_path)
-    assert splitter2.test_indices == splitter.test_indices
-    assert splitter2.fold_indices == splitter.fold_indices
-    print("✓ Reload verified\n")
-
-    # Summary
-    summary = splitter.summary(df)
-
-    # Print nicely
-    print(f"{'='*100}")
-    print("Split Summary")
-    print(f"{'='*100}")
-    print(summary.to_string(index=False, float_format="%.2f"))
-
-    # Verify no overlap
-    test_set = set(splitter.test_indices)
-    all_folds = [set(f) for f in splitter.fold_indices]
-
-    # Test vs folds
-    for i, fold in enumerate(all_folds):
-        overlap = test_set & fold
-        assert len(overlap) == 0, f"Test overlaps with fold {i}: {len(overlap)} rows"
-
-    # Fold vs fold
-    for i in range(len(all_folds)):
-        for j in range(i + 1, len(all_folds)):
-            overlap = all_folds[i] & all_folds[j]
-            assert len(overlap) == 0, f"Fold {i} overlaps with fold {j}: {len(overlap)} rows"
-
-    # All rows accounted for
-    all_assigned = test_set.copy()
-    for fold in all_folds:
-        all_assigned |= fold
-    assert len(all_assigned) == len(df), (
-        f"Mismatch: {len(all_assigned)} assigned vs {len(df)} total"
-    )
-    print(f"\n✓ No overlaps between test and folds")
-    print(f"✓ No overlaps between folds")
-    print(f"✓ All {len(df)} rows accounted for")
-
-    # Film coverage check
-    print(f"\n{'='*100}")
-    print("Film Coverage")
-    print(f"{'='*100}")
-    test_films = set(df.loc[splitter.test_indices, "Film"].unique())
-    trainval_films = set()
-    for fold in splitter.fold_indices:
-        trainval_films |= set(df.loc[fold, "Film"].unique())
-
-    test_only = test_films - trainval_films
-    trainval_only = trainval_films - test_films
-    both = test_films & trainval_films
-
-    print(f"  Films in both train+test:  {len(both)}")
-    print(f"  Films in test only:        {len(test_only)}")
-    print(f"  Films in trainval only:    {len(trainval_only)}")
-    if test_only:
-        print(f"    Test-only films: {sorted(test_only)[:10]}")
-
-    # Dev_dil coverage
-    test_dd = set(df.loc[splitter.test_indices, "dev_dil"].unique())
-    trainval_dd = set()
-    for fold in splitter.fold_indices:
-        trainval_dd |= set(df.loc[fold, "dev_dil"].unique())
-    dd_test_only = test_dd - trainval_dd
-    dd_trainval_only = trainval_dd - test_dd
-
-    print(f"\n  Dev_dils in both:          {len(test_dd & trainval_dd)}")
-    print(f"  Dev_dils in test only:     {len(dd_test_only)}")
-    print(f"  Dev_dils in trainval only: {len(dd_trainval_only)}")
-
-    # Per-fold film coverage
-    print(f"\n{'='*100}")
-    print("Per-Fold Film Coverage (as validation set)")
-    print(f"{'='*100}")
-    for fold in range(splitter.n_folds):
-        train_idx, val_idx = splitter.get_fold(fold)
-        train_films = set(df.loc[train_idx, "Film"].unique())
-        val_films = set(df.loc[val_idx, "Film"].unique())
-        val_only = val_films - train_films
-        print(f"  Fold {fold}: train={len(train_films)} films, val={len(val_films)} films, "
-              f"val-only={len(val_only)} films")
-
-    # Time distribution comparison
-    print(f"\n{'='*100}")
-    print("Time Distribution by Set")
-    print(f"{'='*100}")
-    test_times = df.loc[splitter.test_indices, "35mm"]
-    print(f"  Test:     median={test_times.median():.1f}  mean={test_times.mean():.1f}  "
-          f"std={test_times.std():.1f}  [Q25={test_times.quantile(0.25):.1f}, "
-          f"Q75={test_times.quantile(0.75):.1f}]")
-    for fold in range(splitter.n_folds):
-        train_idx, val_idx = splitter.get_fold(fold)
-        t = df.loc[train_idx, "35mm"]
-        v = df.loc[val_idx, "35mm"]
-        print(f"  Fold {fold} train: median={t.median():.1f}  mean={t.mean():.1f}  "
-              f"std={t.std():.1f}  [Q25={t.quantile(0.25):.1f}, Q75={t.quantile(0.75):.1f}]")
-        print(f"  Fold {fold} val:   median={v.median():.1f}  mean={v.mean():.1f}  "
-              f"std={v.std():.1f}  [Q25={v.quantile(0.25):.1f}, Q75={v.quantile(0.75):.1f}]")
+    main()
